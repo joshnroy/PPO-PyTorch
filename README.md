@@ -1,4 +1,19 @@
-# PPO-PyTorch
+# Textworld RL Agent
+
+## Goal
+
+- Learn to play the [textworld](https://www.microsoft.com/en-us/research/project/textworld/) games (maybe _tabla rusa_) using Deep RL (specifically PPO)
+
+## Steps
+
+- [ ] Very small, single deterministic textworld
+- [ ] Large, single deterministic textworld
+- [ ] Very small, set of deterministic textworlds
+- [ ] Large, set of deterministic textworlds
+- [ ] Do better on the MSR challenge (if they released the validation set)
+
+
+## PPO-PyTorch (Previous Readme)
 Minimal PyTorch implementation of Proximal Policy Optimization with clipped objective for OpenAI gym environments.
 
 ## Usage
