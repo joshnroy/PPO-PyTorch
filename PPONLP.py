@@ -1,8 +1,11 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.distributions import MultivariateNormal
 import gym
 import numpy as np
+import textworld.gym
+import re
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -21,24 +24,53 @@ class Memory:
         del self.rewards[:]
         del self.is_terminals[:]
 
+class StateExtractor(nn.Module):
+    def __init__(self, max_words, state_dim):
+        super(StateExtractor, self).__init__()
+        self.embedding = nn.Embedding(max_words, state_dim)
+        self.lstm = nn.LSTM(input_size=state_dim, hidden_size=state_dim, batch_first=True, num_layers=1, bidirectional=True)
+    
+    def forward(self, x):
+        out = self.embedding(x)
+        out, hidden = self.lstm(out)
+
+        return out
+
+class ActionGenerator(nn.Module):
+    def __init__(self, max_words, state_dim):
+        super(ActionGenerator, self).__init__()
+        self.embedding = nn.Embedding(max_words, state_dim)
+        self.lstm = nn.LSTM(input_size=state_dim, hidden_size=state_dim, batch_first=True, num_layers=1)
+    
+    def forward(self, x):
+        out = self.embedding(x)
+        out, hidden = self.lstm(out)
+
+        return out
+
 class ActorCritic(nn.Module):
-    def __init__(self, state_dim, action_dim, action_std):
+    def __init__(self, state_dim, action_dim, action_std, max_words):
         super(ActorCritic, self).__init__()
+        self.max_words = max_words
+
         # action mean range -1 to 1
         self.actor =  nn.Sequential(
+                StateExtractor(max, state_dim)
                 nn.Linear(state_dim, 64),
-                nn.Tanh(),
+                nn.ReLU(),
                 nn.Linear(64, 32),
-                nn.Tanh(),
+                nn.ReLU(),
                 nn.Linear(32, action_dim),
-                nn.Tanh()
+                nn.ReLU(),
+                ActionGenerator(max_words, state_dim)
                 )
         # critic
         self.critic = nn.Sequential(
+                self.state_extractor,
                 nn.Linear(state_dim, 64),
-                nn.Tanh(),
+                nn.ReLU(),
                 nn.Linear(64, 32),
-                nn.Tanh(),
+                nn.ReLU(),
                 nn.Linear(32, 1)
                 )
         self.action_var = torch.full((action_dim,), action_std*action_std).to(device)
@@ -81,18 +113,35 @@ class PPO:
         self.gamma = gamma
         self.eps_clip = eps_clip
         self.K_epochs = K_epochs
+
+        self.max_words = 10_000
         
-        self.policy = ActorCritic(state_dim, action_dim, action_std).to(device)
-        self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=lr, betas=betas)
+        self.policy = ActorCritic(state_dim, action_dim, action_std, max_words=self.max_words).to(device)
+        self.optimizer = torch.optim.SparseAdam(self.policy.parameters(), lr=lr, betas=betas)
         
-        self.policy_old = ActorCritic(state_dim, action_dim, action_std).to(device)
+        self.policy_old = ActorCritic(state_dim, action_dim, action_std, max_words=self.max_words).to(device)
         self.policy_old.load_state_dict(self.policy.state_dict())
         
         self.MseLoss = nn.MSELoss()
+
+        self.word_to_idx = {"<END>": 0}
+        self.idx_to_word = {0: "<END>"}
     
     def select_action(self, state, memory):
-        state = torch.FloatTensor(state.reshape(1, -1)).to(device)
-        return self.policy_old.act(state, memory).cpu().data.numpy().flatten()
+        state = state.lower()
+        state = re.findall(r"[\w]+|[.,!?;']", state)
+        # state = [x for x in state if x != '']
+        idx_state = []
+        for s in state:
+            if s not in self.word_to_idx:
+                idx = len(self.word_to_idx)
+                self.word_to_idx[s] = idx
+                self.idx_to_word[idx] = s
+            idx_state.append(self.word_to_idx[s])
+        idx_state = np.array(idx_state)
+        idx_state = torch.LongTensor(idx_state.reshape(1, -1)).to(device)
+        # onehot_state = F.one_hot(idx_state, self.max_words)
+        return self.policy_old.act(idx_state, memory).cpu().data.numpy().flatten()
     
     def update(self, memory):
         # Monte Carlo estimate of rewards:
@@ -100,7 +149,7 @@ class PPO:
         discounted_reward = 0
         for reward, is_terminal in zip(reversed(memory.rewards), reversed(memory.is_terminals)):
             if is_terminal:
-                discounted_reward = 0
+                discounted_reward = reward
             discounted_reward = reward + (self.gamma * discounted_reward)
             rewards.insert(0, discounted_reward)
         
@@ -137,14 +186,16 @@ class PPO:
         
 def main():
     ############## Hyperparameters ##############
-    env_name = "BipedalWalker-v2"
+    # Register a text-based game as a new Gym's environment.
+    # env_id = textworld.gym.register_game("tw_games/custom_game.ulx", max_episode_steps=50, request_infos=textworld.core.EnvInfos(admissible_commands=True))
+    env_id = textworld.gym.register_game("tw_games/custom_game.ulx", max_episode_steps=50)
     render = False
-    solved_reward = 300         # stop training if avg_reward > solved_reward
+    solved_reward = 1         # stop training if avg_reward > solved_reward
     log_interval = 20           # print avg reward in the interval
     max_episodes = 10000        # max training episodes
-    max_timesteps = 1500        # max timesteps in one episode
+    max_timesteps = 50        # max timesteps in one episode
     
-    update_timestep = 4000      # update policy every n timesteps
+    update_timestep = max_timesteps * 4      # update policy every n timesteps
     action_std = 0.5            # constant std for action distribution (Multivariate Normal)
     K_epochs = 80               # update policy for K epochs
     eps_clip = 0.2              # clip parameter for PPO
@@ -157,9 +208,9 @@ def main():
     #############################################
     
     # creating environment
-    env = gym.make(env_name)
-    state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.shape[0]
+    env = gym.make(env_id)
+    state_dim = 128
+    action_dim = 128
     
     if random_seed:
         print("Random Seed: {}".format(random_seed))
@@ -169,7 +220,6 @@ def main():
     
     memory = Memory()
     ppo = PPO(state_dim, action_dim, action_std, lr, betas, gamma, K_epochs, eps_clip)
-    print(lr,betas)
     
     # logging variables
     running_reward = 0
@@ -178,7 +228,7 @@ def main():
     
     # training loop
     for i_episode in range(1, max_episodes+1):
-        state = env.reset()
+        state, _ = env.reset()
         for t in range(max_timesteps):
             time_step +=1
             # Running policy_old:
@@ -203,7 +253,7 @@ def main():
         avg_length += t
         
         # stop training if avg_reward > solved_reward
-        if running_reward > (log_interval*solved_reward):
+        if running_reward >= (log_interval*solved_reward):
             print("########## Solved! ##########")
             torch.save(ppo.policy.state_dict(), './PPO_continuous_solved_{}.pth'.format(env_name))
             break
