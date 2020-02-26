@@ -28,23 +28,25 @@ class StateExtractor(nn.Module):
     def __init__(self, max_words, state_dim):
         super(StateExtractor, self).__init__()
         self.embedding = nn.Embedding(max_words, state_dim)
-        self.lstm = nn.LSTM(input_size=state_dim, hidden_size=state_dim, batch_first=True, num_layers=1, bidirectional=True)
+        self.lstm = nn.LSTM(input_size=state_dim, hidden_size=state_dim//2, batch_first=True, num_layers=1, bidirectional=True)
     
     def forward(self, x):
         out = self.embedding(x)
         out, hidden = self.lstm(out)
-
+        out = torch.sum(out, dim=1)
         return out
 
 class ActionGenerator(nn.Module):
     def __init__(self, max_words, state_dim):
         super(ActionGenerator, self).__init__()
-        self.embedding = nn.Embedding(max_words, state_dim)
         self.lstm = nn.LSTM(input_size=state_dim, hidden_size=state_dim, batch_first=True, num_layers=1)
+        self.out = nn.Linear(state_dim, max_words)
     
     def forward(self, x):
-        out = self.embedding(x)
+        # TODO: What should the input be here?
+        out = x.unsqueeze(1).expand(x.shape[0], 10, x.shape[1])
         out, hidden = self.lstm(out)
+        out = F.softmax(self.out(out), dim=-1)
 
         return out
 
@@ -53,20 +55,23 @@ class ActorCritic(nn.Module):
         super(ActorCritic, self).__init__()
         self.max_words = max_words
 
+        action_generator = ActionGenerator(max_words, state_dim)
+        state_extractor = StateExtractor(max_words, state_dim)
+
         # action mean range -1 to 1
         self.actor =  nn.Sequential(
-                StateExtractor(max, state_dim)
+                state_extractor,
                 nn.Linear(state_dim, 64),
                 nn.ReLU(),
                 nn.Linear(64, 32),
                 nn.ReLU(),
                 nn.Linear(32, action_dim),
                 nn.ReLU(),
-                ActionGenerator(max_words, state_dim)
+                action_generator
                 )
         # critic
         self.critic = nn.Sequential(
-                self.state_extractor,
+                state_extractor,
                 nn.Linear(state_dim, 64),
                 nn.ReLU(),
                 nn.Linear(64, 32),
@@ -78,6 +83,7 @@ class ActorCritic(nn.Module):
     def forward(self):
         raise NotImplementedError
     
+    # TODO: This needs to be changed to fit the NLP thing
     def act(self, state, memory):
         action_mean = self.actor(state)
         cov_mat = torch.diag(self.action_var).to(device)
@@ -92,6 +98,7 @@ class ActorCritic(nn.Module):
         
         return action.detach()
     
+    # TODO: This needs to be changed to fit the NLP thing
     def evaluate(self, state, action):   
         action_mean = self.actor(state)
         
@@ -124,11 +131,11 @@ class PPO:
         
         self.MseLoss = nn.MSELoss()
 
-        self.word_to_idx = {"<END>": 0}
-        self.idx_to_word = {0: "<END>"}
+        self.word_to_idx = {"<END>": 0, "<START>": 1}
+        self.idx_to_word = {0: "<END>", 1: "<START>"}
     
     def select_action(self, state, memory):
-        state = state.lower()
+        state = state.lower() + " <STOP>"
         state = re.findall(r"[\w]+|[.,!?;']", state)
         # state = [x for x in state if x != '']
         idx_state = []
